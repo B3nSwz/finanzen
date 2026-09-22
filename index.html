@@ -436,7 +436,15 @@ function when(iso){
          d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'}) + ' Uhr';
 }
 
-function load(){ try { const r = localStorage.getItem(STORE); state = r ? JSON.parse(r) : null; } catch(e){ state = null; } }
+function migrate(d){
+  if(!d) return d;
+  if(!Array.isArray(d.stocks)){
+    d.stocks = d.bitmine ? [{ name: 'Bitmine', ticker: 'BMNR', bestand: d.bitmine.bestand, preis: d.bitmine.preis }] : [];
+  }
+  delete d.bitmine;
+  return d;
+}
+function load(){ try { const r = localStorage.getItem(STORE); state = migrate(r ? JSON.parse(r) : null); } catch(e){ state = null; } }
 function save(){ try { localStorage.setItem(STORE, JSON.stringify(state)); } catch(e){} }
 
 // DexScreener-Link oder "chain/pair" -> {chain, pair}
@@ -451,7 +459,7 @@ function calc(){
   const s = state, h = s.hyperliquid, fx = s.fx || 0.87;
   const btc = s.btc.bestand * s.btc.preis;
   const alts = s.altcoins.reduce((a, c) => a + c.bestand * c.preis, 0);
-  const bm = s.bitmine.bestand * s.bitmine.preis;
+  const bm = s.stocks.reduce((a, x) => a + x.bestand * x.preis, 0);
   const lbs = s.lbs;
   const pnl = (h.side === 'short' ? (h.entry - h.mark) : (h.mark - h.entry)) * h.size;
   const hlUsdt = h.margin + pnl;
@@ -464,7 +472,7 @@ function calc(){
 const SEG = [
   ['btc', 'Bitcoin', 'var(--amber)'],
   ['alts', 'Altcoins', 'var(--coral)'],
-  ['bm', 'Bitmine', 'var(--sage)'],
+  ['bm', 'Aktien & ETFs', 'var(--sage)'],
   ['lbs', 'Bausparvertrag', 'var(--sky)'],
   ['hl', 'Hyperliquid Future', 'var(--risk)'],
 ];
@@ -480,7 +488,7 @@ function updateNumbers(){
     else if(k.startsWith('leg:')){ const seg = SEG.find(x => x[0] === k.slice(4)); el.textContent = seg[1] + ' \u00b7 ' + fmt(pct(c[seg[0]], c.total), 1) + '%'; }
     else if(k.startsWith('alt:')){ const a = state.altcoins[+k.slice(4)]; if(a) el.textContent = eur(a.bestand * a.preis); }
     else if(k === 'btcval') el.textContent = eur(c.btc);
-    else if(k === 'bmval') el.textContent = eur(c.bm);
+    else if(k.startsWith('stk:')){ const x = state.stocks[+k.slice(4)]; if(x) el.textContent = eur(x.bestand * x.preis); }
     else if(k === 'hlpos') el.textContent = usdt(c.posUsdt);
     else if(k === 'hlpnl'){ el.textContent = (c.pnl >= 0 ? '+' : '') + usdt(c.pnl); el.className = c.pnl >= 0 ? 'pos' : 'neg'; }
     else if(k === 'hlval') el.textContent = usdt(c.hlUsdt) + ' \u2248 ' + eur(c.hl);
@@ -533,31 +541,56 @@ async function refresh(){
   st.dex = total ? (okCount + '/' + total) : '\u2013';
   if(okCount) any = true;
 
-  // 3) Bitmine: mehrere Quellen nacheinander, nie manuell
-  let bmUsd = null, bmQuelle = '';
-  const yahooUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/BMNR?interval=1d&range=1d';
-  const ausYahoo = d => { const m = d && d.chart && d.chart.result && d.chart.result[0] && d.chart.result[0].meta; return m && m.regularMarketPrice ? m.regularMarketPrice : null; };
-  const quellen = [
-    ['Yahoo', async () => ausYahoo(await getJSON(yahooUrl))],
-    ['Yahoo 2', async () => ausYahoo(await getJSON(yahooUrl.replace('query1', 'query2')))],
-    ['Stooq', async () => {
-      const r = await fetch('https://stooq.com/q/l/?s=bmnr.us&f=sd2t2ohlcv&h&e=csv', { cache: 'no-store' });
-      if(!r.ok) throw new Error('HTTP ' + r.status);
-      const zeilen = (await r.text()).trim().split('\n');
-      const c = num((zeilen[1] || '').split(',')[6]);
-      return c > 0 ? c : null;
-    }],
-    ['Yahoo (Umweg)', async () => ausYahoo(await getJSON('https://api.allorigins.win/raw?url=' + encodeURIComponent(yahooUrl)))],
-  ];
-  if(state.finnhubKey) quellen.push(['Finnhub', async () => {
-    const d = await getJSON('https://finnhub.io/api/v1/quote?symbol=BMNR&token=' + encodeURIComponent(state.finnhubKey));
-    return d && d.c ? d.c : null;
-  }]);
-  for(const [name, fn] of quellen){
-    try { const v = await fn(); if(v){ bmUsd = v; bmQuelle = name; break; } } catch(e){}
+  // 3) Aktien & ETFs: pro Ticker mehrere Quellen nacheinander, nie manuell
+  const rates = { EUR: 1, USD: state.fx || 0.87 };
+  async function rate(cur){
+    cur = (cur || 'USD').toUpperCase();
+    if(rates[cur] != null) return rates[cur];
+    try {
+      const d = await getJSON('https://query1.finance.yahoo.com/v8/finance/chart/' + cur + 'EUR=X?interval=1d&range=1d');
+      const m = d && d.chart && d.chart.result && d.chart.result[0] && d.chart.result[0].meta;
+      if(m && m.regularMarketPrice){ rates[cur] = m.regularMarketPrice; return rates[cur]; }
+    } catch(e){}
+    rates[cur] = null; return null;
   }
-  if(bmUsd !== null){ state.bitmine.preis = bmUsd * (state.fx || 0.87); state.bmQuelle = bmQuelle; st.bmnr = 'ok'; any = true; }
-  else st.bmnr = 'keine Quelle erreichbar';
+  function yahooKurs(d){
+    const m = d && d.chart && d.chart.result && d.chart.result[0] && d.chart.result[0].meta;
+    return m && m.regularMarketPrice ? { kurs: m.regularMarketPrice, waehrung: m.currency || 'USD' } : null;
+  }
+  function stooqSymbol(t){ t = String(t).toLowerCase(); return t.includes('.') ? t : t + '.us'; }
+  async function kursFuer(ticker){
+    const yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(ticker) + '?interval=1d&range=1d';
+    const quellen = [
+      ['Yahoo', async () => yahooKurs(await getJSON(yUrl))],
+      ['Yahoo 2', async () => yahooKurs(await getJSON(yUrl.replace('query1', 'query2')))],
+      ['Stooq', async () => {
+        const r = await fetch('https://stooq.com/q/l/?s=' + stooqSymbol(ticker) + '&f=sd2t2ohlcv&h&e=csv', { cache: 'no-store' });
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        const z = (await r.text()).trim().split('\n');
+        const c = num((z[1] || '').split(',')[6]);
+        // Stooq nennt keine W\u00e4hrung: .de/.f = Euro, sonst Dollar
+        return c > 0 ? { kurs: c, waehrung: /\.(de|f|pl)$/i.test(stooqSymbol(ticker)) ? 'EUR' : 'USD' } : null;
+      }],
+      ['Yahoo (Umweg)', async () => yahooKurs(await getJSON('https://api.allorigins.win/raw?url=' + encodeURIComponent(yUrl)))],
+    ];
+    if(state.finnhubKey) quellen.push(['Finnhub', async () => {
+      const d = await getJSON('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(ticker) + '&token=' + encodeURIComponent(state.finnhubKey));
+      return d && d.c ? { kurs: d.c, waehrung: 'USD' } : null;
+    }]);
+    for(const [name, fn] of quellen){
+      try { const v = await fn(); if(v){ return { ...v, quelle: name }; } } catch(e){}
+    }
+    return null;
+  }
+  let stkOk = 0;
+  for(const x of state.stocks){
+    if(!x.ticker){ x.ok = false; continue; }
+    const v = await kursFuer(x.ticker);
+    const k = v ? await rate(v.waehrung) : null;
+    if(v && k){ x.preis = v.kurs * k; x.waehrung = v.waehrung; x.quelle = v.quelle; x.ok = true; stkOk++; any = true; }
+    else x.ok = false;
+  }
+  st.stocks = state.stocks.length ? (stkOk + '/' + state.stocks.length) : '\u2013';
 
   if(any) state.lastUpdate = new Date().toISOString();
   state.status = st; save(); busy = false; render();
@@ -567,7 +600,7 @@ function setStatus(t){ const el = $('#status'); if(el) el.textContent = t; }
 function statusText(){
   const s = state.status || {};
   const mark = v => v === 'ok' ? '\u2713' : (v || '\u2013');
-  return 'BTC/HYPE ' + mark(s.coingecko) + ' \u00b7 Altcoins ' + (s.dex || '\u2013') + ' \u00b7 Bitmine ' + mark(s.bmnr);
+  return 'BTC/HYPE ' + mark(s.coingecko) + ' \u00b7 Altcoins ' + (s.dex || '\u2013') + ' \u00b7 Aktien ' + (s.stocks || '\u2013');
 }
 
 // ---------- Import / Export ----------
@@ -581,7 +614,7 @@ function exportData(){ const { status, ...rest } = state; return encode(rest); }
 function importData(code){
   const d = decode(code);
   if(!d || !d.btc || !Array.isArray(d.altcoins) || !d.hyperliquid) throw new Error('Code unvollst\u00e4ndig');
-  state = d; save(); render(); refresh();
+  state = migrate(d); save(); render(); refresh();
 }
 
 // ---------- Darstellung ----------
@@ -625,8 +658,15 @@ function render(){
         <div><span class="section-total" data-v="sum:${key}"></span><span class="section-share" data-v="share:${key}"></span></div>
       </div>${body}</div>`;
   const head = `<div class="row head"><div>Position</div><div>Bestand</div><div>Kurs (\u20ac)</div><div>Wert</div><div></div></div>`;
-  const bmOk = s.status && s.status.bmnr === 'ok';
-  const bmQ = bmOk ? ('Kurs live (' + (s.bmQuelle || 'Yahoo') + ')') : ('letzter bekannter Kurs \u2013 ' + (s.status && s.status.bmnr ? s.status.bmnr : 'noch nicht abgerufen'));
+  const stkRow = (x, i) => {
+    const quelle = x.ok ? ('Kurs live (' + (x.quelle || 'Yahoo') + ')' + (x.waehrung && x.waehrung !== 'EUR' ? ' \u00b7 aus ' + x.waehrung : ''))
+      : (x.ok === false ? 'Kurs nicht abrufbar \u2013 Ticker pr\u00fcfen' : 'noch nicht abgerufen');
+    const edit = `<button class="lnk" data-tick="${i}" title="Ticker \u00e4ndern">\u270e</button>`;
+    const kurs = Number(x.preis).toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return row(`<div class="row-name">${esc(x.name)} ${edit}<span class="sub">${esc(x.ticker || '')} \u00b7 ${quelle}</span></div>`,
+      inp('', x.bestand, `data-stk="${i}"`), `<div class="price">${kurs}</div>`, 'stk:' + i,
+      `<button class="rm" data-rmstk="${i}" title="entfernen">\u00d7</button>`);
+  };
 
   $('#app').innerHTML = `
     <div class="hero">
@@ -648,8 +688,8 @@ function render(){
         : `+ ${small.length} kleinere Position${small.length === 1 ? '' : 'en'} \u2013 zusammen <b>${eur(smallSum)}</b>`}</span><span class="chev">${showSmall ? '\u2212' : '+'}</span></div>` : '') +
       `<div class="addbar"><input type="text" id="newName" placeholder="Name des Coins"><input type="url" id="newPair" class="sub-input" placeholder="DexScreener-Link"><button id="addBtn">+ hinzuf\u00fcgen</button></div>`)}
 
-    ${sec('bm', 'Bitmine (Einzelaktie)', head + row('<div class="row-name">Bitmine<span class="sub">' + bmQ + '</span></div>',
-        inp('bmB', s.bitmine.bestand), `<div class="price">${fmt(s.bitmine.preis, 2)}</div>`, 'bmval'))}
+    ${sec('bm', 'Aktien &amp; ETFs', head + s.stocks.map(stkRow).join('') +
+      `<div class="addbar"><input type="text" id="newStkName" placeholder="Name, z.\u2009B. Vanguard All-World"><input type="text" id="newStkTicker" class="sub-input" placeholder="Ticker, z.\u2009B. VWCE.DE"><button id="addStk">+ hinzuf\u00fcgen</button></div>`)}
 
     ${sec('lbs', 'Bausparvertrag \u2013 LBS', `<div class="manual-box"><label>Guthaben (manuell)</label>${inp('lbs', s.lbs)}</div>`)}
 
@@ -682,7 +722,7 @@ function render(){
       <p><b>Import:</b> ersetzt alle Daten auf diesem Ger\u00e4t.</p>
       <textarea id="imp2" rows="3" placeholder="Import-Code einf\u00fcgen"></textarea>
       <button class="btn" id="impBtn2">Importieren</button>
-      <p><b>Bitmine:</b> Der Kurs wird automatisch geholt (Yahoo, Stooq, Ersatzweg) und ist nicht von Hand \u00e4nderbar. Wenn keine Quelle erreichbar ist, hilft ein kostenloser Schl\u00fcssel von finnhub.io als letzte Reserve.</p>
+      <p><b>Aktien &amp; ETFs:</b> Kurse werden automatisch \u00fcber den Ticker geholt (Yahoo, Stooq, Ersatzweg) und sind nicht von Hand \u00e4nderbar. Fremdw\u00e4hrungen werden in Euro umgerechnet. Deutsche B\u00f6rsen brauchen den Zusatz, z.\u2009B. VWCE.DE. Als letzte Reserve hilft ein kostenloser Schl\u00fcssel von finnhub.io.</p>
       <input type="text" id="fhKey" placeholder="Finnhub API-Schl\u00fcssel" value="${esc(s.finnhubKey || '')}">
       <button class="btn" id="fhBtn">Schl\u00fcssel speichern</button>
       <div class="err" id="setErr"></div>
@@ -695,7 +735,6 @@ function render(){
 function bind(){
   const on = (id, f) => { const el = $('#' + id); if(el) el.addEventListener('input', e => { f(e.target.value); save(); updateNumbers(); }); };
   on('btcB', v => state.btc.bestand = num(v));
-  on('bmB', v => state.bitmine.bestand = num(v));
   on('lbs', v => state.lbs = num(v));
   on('hlLev', v => state.hyperliquid.leverage = num(v));
   on('hlSize', v => state.hyperliquid.size = num(v));
@@ -704,6 +743,24 @@ function bind(){
   on('hlLiq', v => state.hyperliquid.liq = num(v));
   on('hlPair', v => state.hyperliquid.pair = v);
   $('#hlSide').addEventListener('change', e => { state.hyperliquid.side = e.target.value; save(); updateNumbers(); });
+  document.querySelectorAll('[data-stk]').forEach(el => el.addEventListener('input', e => {
+    state.stocks[+e.target.dataset.stk].bestand = num(e.target.value); save(); updateNumbers();
+  }));
+  document.querySelectorAll('[data-rmstk]').forEach(el => el.addEventListener('click', e => {
+    const i = +e.currentTarget.dataset.rmstk;
+    if(confirm(state.stocks[i].name + ' entfernen?')){ state.stocks.splice(i, 1); save(); render(); }
+  }));
+  document.querySelectorAll('[data-tick]').forEach(el => el.addEventListener('click', e => {
+    const i = +e.currentTarget.dataset.tick, x = state.stocks[i];
+    const v = prompt('Ticker f\u00fcr ' + x.name + ' (z.\u2009B. BMNR oder VWCE.DE):', x.ticker || '');
+    if(v === null) return;
+    x.ticker = v.trim().toUpperCase(); x.ok = undefined; save(); render(); refresh();
+  }));
+  $('#addStk').onclick = () => {
+    const name = $('#newStkName').value.trim(), t = $('#newStkTicker').value.trim().toUpperCase();
+    if(!name || !t){ alert('Bitte Name und Ticker eintragen.'); return; }
+    state.stocks.push({ name, ticker: t, bestand: 0, preis: 0 }); save(); render(); refresh();
+  };
   document.querySelectorAll('[data-alt]').forEach(el => el.addEventListener('input', e => {
     state.altcoins[+e.target.dataset.alt][e.target.dataset.f] = num(e.target.value); save(); updateNumbers();
   }));
